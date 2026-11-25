@@ -164,6 +164,44 @@ class Spreadsheet:
         """
         return self.client.values_batch_get(self.id, ranges, params=params)
 
+    def read_round(self) -> Any:
+        """Context manager that activates the in-round batch read cache.
+
+        Shorthand for ``spreadsheet.client.read_round()``; see
+        :meth:`gspread.http_client.HTTPClient.read_round`.
+
+        .. versionadded:: 6.3
+        """
+        return self.client.read_round()
+
+    def start_read_round(self) -> Any:
+        """Start a read round, returning its cache.
+
+        Shorthand for ``spreadsheet.client.start_read_round()``.
+
+        .. versionadded:: 6.3
+        """
+        return self.client.start_read_round()
+
+    def end_read_round(self) -> None:
+        """End a round started with :meth:`start_read_round`.
+
+        .. versionadded:: 6.3
+        """
+        self.client.end_read_round()
+
+    def clear_read_cache(self) -> None:
+        """Forget every cell read so far in the current round.
+
+        .. versionadded:: 6.3
+        """
+        self.client.clear_read_cache()
+
+    @property
+    def read_cache_active(self) -> bool:
+        """Whether a read round is currently active."""
+        return self.client.read_cache_active
+
     def values_update(
         self,
         range: str,

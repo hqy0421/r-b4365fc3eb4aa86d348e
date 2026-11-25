@@ -32,6 +32,22 @@ from typing import (
 from .cell import Cell
 from .exceptions import GSpreadException
 from .http_client import DefaultSerializerType, HTTPClient, ParamsType
+from .read_cache import (
+    Bounds,
+    ReadCache,
+    ReadOptions,
+    RequestPlan,
+    a1_part_of_range,
+    account_identity,
+    answers_bounds,
+    bounds_from_a1,
+    bounds_to_a1,
+    intersect_bounds,
+    is_complete_value_range,
+    iter_cell_values,
+    prove_bounds,
+    split_sheet_prefix,
+)
 from .urls import WORKSHEET_DRIVE_URL
 from .utils import (
     DateTimeOption,
@@ -1020,12 +1036,73 @@ class Worksheet:
             return values
         raise ValueError("return_type must be either ValueRange or ListOfLists")
 
+    def read_round(self) -> Any:
+        """Start a round of stable reads on this worksheet's client.
+
+        Shorthand for ``worksheet.client.read_round()``.  See
+        :meth:`gspread.http_client.HTTPClient.read_round`.
+
+        .. versionadded:: 6.3
+        """
+        return self.client.read_round()
+
+    def start_read_round(self) -> Any:
+        """Start a read round, returning its cache.
+
+        Shorthand for ``worksheet.client.start_read_round()``.
+
+        .. versionadded:: 6.3
+        """
+        return self.client.start_read_round()
+
+    def end_read_round(self) -> None:
+        """End a round started with :meth:`start_read_round`.
+
+        Shorthand for ``worksheet.client.end_read_round()``.
+
+        .. versionadded:: 6.3
+        """
+        self.client.end_read_round()
+
+    def clear_read_cache(self) -> None:
+        """Forget every cell read so far in the current round.
+
+        .. versionadded:: 6.3
+        """
+        self.client.clear_read_cache()
+
+    @property
+    def read_cache_active(self) -> bool:
+        """Whether a read round is currently active for this worksheet."""
+        return bool(getattr(self.client, "read_cache_active", False))
+
+    @property
+    def _grid_bounds(self) -> Optional[Bounds]:
+        """Finite bounds of the worksheet grid, when it is known."""
+        grid = self._properties.get("gridProperties") or {}
+        rows = grid.get("rowCount")
+        columns = grid.get("columnCount")
+        if isinstance(rows, int) and isinstance(columns, int):
+            return (0, rows, 0, columns)
+        return None
+
+    @property
+    def _cache_worksheet_id(self) -> Any:
+        """Identity of this worksheet inside the read cache.
+
+        ``sheetId`` is stable and unique within a spreadsheet; the title is a
+        fallback for objects created without full properties.
+        """
+        return self._properties.get("sheetId", self.title)
+
     def batch_get(
         self,
         ranges: Iterable[str],
         major_dimension: Optional[Dimension] = None,
         value_render_option: Optional[ValueRenderOption] = None,
         date_time_render_option: Optional[DateTimeOption] = None,
+        cache: Optional[ReadCache] = None,
+        read_cache: Optional[ReadCache] = None,
     ) -> List[ValueRange]:
         """Returns one or more ranges of values from the sheet.
 
@@ -1084,14 +1161,38 @@ class Worksheet:
             The default ``date_time_render_option`` is ``DateTimeOption.serial_number``.
         :type date_time_render_option: :class:`~gspread.utils.DateTimeOption`
 
+        :param ReadCache read_cache: (optional) An explicit cache registry to
+            use instead of the one attached to the client.  Most callers
+            should prefer :meth:`gspread.http_client.HTTPClient.read_round`
+            (also available as :meth:`gspread.client.Client.read_round` and
+            :meth:`read_round`).
+
+        :param ReadCache cache: Alias of ``read_cache``.
+
         .. versionadded:: 3.3
+
+        .. versionchanged:: 6.3
+            Added in-round caching.  Inside a read round the sheet is assumed
+            to be stable: only cells that have not been read yet in the round
+            are requested, overlapping ranges of the same call are requested
+            once, and a call that is fully cached sends no request at all.
+            Cached values are isolated per account, worksheet and render
+            options, and are dropped when the round ends.  The returned
+            matrices are rebuilt in request order and orientation with blank
+            cells padded out.  Without an active round (the default) requests
+            and responses are exactly as before.
 
         Examples::
 
             # Read values from 'A1:B2' range and 'F12' cell
             worksheet.batch_get(['A1:B2', 'F12'])
+
+            # Read overlapping ranges, fetching each cell only once
+            with client.read_round():
+                worksheet.batch_get(['A1:C10', 'B5:D20'])
+                worksheet.batch_get(['B5:D20'])  # served from the cache
         """
-        ranges = [absolute_range_name(self.title, r) for r in ranges if r]
+        absolute_ranges = [absolute_range_name(self.title, r) for r in ranges if r]
 
         params: ParamsType = {
             "majorDimension": major_dimension,
@@ -1099,11 +1200,261 @@ class Worksheet:
             "dateTimeRenderOption": date_time_render_option,
         }
 
-        response = self.client.values_batch_get(
-            self.spreadsheet_id, ranges=ranges, params=params
+        options = ReadOptions.from_request(
+            major_dimension=major_dimension,
+            value_render_option=value_render_option,
+            date_time_render_option=date_time_render_option,
         )
 
-        return [ValueRange.from_json(x) for x in response["valueRanges"]]
+        registry = read_cache if read_cache is not None else cache
+        worksheet_cache = self._resolve_read_cache(options, registry)
+        if worksheet_cache is None:
+            response = self.client.values_batch_get(
+                self.spreadsheet_id, ranges=absolute_ranges, params=params
+            )
+
+            return [ValueRange.from_json(x) for x in response["valueRanges"]]
+
+        return self._cached_batch_get(absolute_ranges, options, params, worksheet_cache)
+
+    def _resolve_read_cache(
+        self, options: ReadOptions, read_cache: Optional[ReadCache]
+    ) -> Optional[Any]:
+        """Return the worksheet cache to use, or ``None`` when not caching."""
+        registry = read_cache
+        if registry is None:
+            if not isinstance(self.client, HTTPClient) or not (
+                self.client.read_cache_active
+            ):
+                return None
+            registry = self.client._read_cache
+
+        return registry.sheet(
+            account_identity(self.client),
+            self.spreadsheet_id,
+            self._cache_worksheet_id,
+            options,
+        )
+
+    def _cached_batch_get(
+        self,
+        absolute_ranges: List[str],
+        options: ReadOptions,
+        params: ParamsType,
+        cache: Any,
+    ) -> List[ValueRange]:
+        """Batch read with in-round coverage tracking."""
+        originals: List[Tuple[str, str, Optional[Bounds]]] = [
+            (absolute, a1_part_of_range(absolute), bounds_from_a1(absolute))
+            for absolute in absolute_ranges
+        ]
+
+        grid = self._grid_bounds
+        plan = self._plan_cached_requests(originals, cache.coverage, grid)
+
+        if not plan.requested_ranges:
+            # Full hit: no request at all.
+            return [
+                self._rebuild_value_range(bounds, options, cache)
+                for _absolute, _a1_text, bounds in originals
+                if bounds is not None
+            ]
+
+        response = self.client.values_batch_get(
+            self.spreadsheet_id, ranges=plan.requested_ranges, params=dict(params)
+        )
+
+        # Commit only what this response proves.  A failing request raises
+        # before this point; for a truncated response only the verified prefix
+        # is committed, so unverified ranges are requested again later in the
+        # round.
+        entries, complete = self._trusted_value_ranges(response, plan.request_bounds)
+        self._commit_verified_entries(
+            entries, plan.request_bounds, options, cache, grid
+        )
+
+        if not complete:
+            return self._best_effort_results(
+                response,
+                originals,
+                plan.original_request_indexes,
+                options,
+                cache,
+                grid,
+            )
+
+        results: List[ValueRange] = []
+        for index, (_absolute, _a1_text, bounds) in enumerate(originals):
+            pieces = plan.original_request_indexes[index]
+            if bounds is None:
+                results.append(ValueRange.from_json(entries[pieces[0]]))
+            else:
+                results.append(self._rebuild_value_range(bounds, options, cache))
+
+        return results
+
+    def _plan_cached_requests(
+        self,
+        originals: List[Tuple[str, str, Optional[Bounds]]],
+        coverage: Any,
+        grid: Optional[Bounds] = None,
+    ) -> RequestPlan:
+        """Work out which rectangles must be requested for this call.
+
+        ``coverage`` already contains everything proven in this round and grows
+        as the call schedules rectangles, so ranges overlapping within a single
+        call are only requested once.  Named and unbounded ranges cannot be
+        cached and are always requested, deduplicated by literal spelling.
+        """
+        plan = RequestPlan()
+        shared_indexes: Dict[str, int] = {}
+
+        for absolute, _a1_text, bounds in originals:
+            if bounds is None:
+                index = shared_indexes.get(absolute)
+                if index is None:
+                    index = plan.add(absolute, None)
+                    shared_indexes[absolute] = index
+                plan.original_request_indexes.append([index])
+                continue
+
+            # Cells outside the worksheet grid are always blank, so only the
+            # part that can actually hold values has to be read.
+            readable = bounds if grid is None else intersect_bounds(bounds, grid)
+            missing = [] if readable is None else coverage.missing(readable)
+            plan.original_request_indexes.append(
+                plan.add_missing(absolute, bounds, missing, self.title)
+            )
+
+            for rectangle in missing:
+                coverage.add(rectangle)
+
+        return plan
+
+    @staticmethod
+    def _commit_verified_entries(
+        entries: List[Mapping[str, Any]],
+        request_bounds: List[Optional[Bounds]],
+        options: ReadOptions,
+        cache: Any,
+        grid: Optional[Bounds] = None,
+    ) -> None:
+        """Mark as covered the rectangles proven by trusted response entries.
+
+        Only the rectangle the API actually echoed is marked, so a reply that
+        clips a range at the grid edge never covers cells it did not return.
+        """
+        for entry, bounds in zip(entries, request_bounds):
+            if bounds is None:
+                continue
+
+            proven = prove_bounds(entry, bounds, grid)
+            if proven is None:
+                continue
+
+            cache.note_sheet_prefix(split_sheet_prefix(entry["range"], "")[0])
+            cache.mark_verified(
+                proven,
+                iter_cell_values(entry, proven, options.major_dimension),
+            )
+
+    @staticmethod
+    def _trusted_value_ranges(
+        response: Any, request_bounds: List[Optional[Bounds]]
+    ) -> Tuple[List[Mapping[str, Any]], bool]:
+        """Return the verified prefix of a batchGet response and its status.
+
+        ``valueRanges`` is documented to hold one entry per requested range,
+        in order.  Replies with fewer entries (a truncated answer) still prove
+        the entries they carry, so that verified prefix is trusted; a reply
+        with more entries than requested is inconsistent and nothing is
+        trusted.  A malformed entry or one answering a different rectangle
+        ends the walk.  The boolean is ``True`` only when every requested range
+        was answered.
+        """
+        value_ranges = (
+            response.get("valueRanges") if isinstance(response, Mapping) else None
+        )
+
+        if not isinstance(value_ranges, list) or len(value_ranges) > len(
+            request_bounds
+        ):
+            return [], False
+
+        trusted: List[Mapping[str, Any]] = []
+        for entry, bounds in zip(value_ranges, request_bounds):
+            if not is_complete_value_range(entry):
+                break
+            if bounds is not None and not answers_bounds(entry, bounds):
+                break
+            trusted.append(entry)
+
+        complete = len(trusted) == len(request_bounds)
+        return trusted, complete
+
+    def _best_effort_results(
+        self,
+        response: Any,
+        originals: List[Tuple[str, str, Optional[Bounds]]],
+        original_request_indexes: List[List[int]],
+        options: ReadOptions,
+        cache: Any,
+        grid: Optional[Bounds] = None,
+    ) -> List[ValueRange]:
+        """Build results from an untrustworthy response, caching nothing more.
+
+        A bounded range is returned only when verified data (from this round)
+        covers it completely; a partially verified range is omitted rather
+        than returned truncated.  Unbounded and named ranges are returned
+        from the API entry when one was included in the response.
+        """
+        raw_entries = (
+            response.get("valueRanges") if isinstance(response, Mapping) else None
+        )
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+
+        coverage = cache.coverage
+        results: List[ValueRange] = []
+
+        for index, (_absolute, _a1_text, bounds) in enumerate(originals):
+            request_indexes = original_request_indexes[index]
+
+            if bounds is None:
+                if request_indexes and request_indexes[0] < len(raw_entries):
+                    entry = raw_entries[request_indexes[0]]
+                    if is_complete_value_range(entry):
+                        results.append(ValueRange.from_json(entry))
+                continue
+
+            readable = bounds if grid is None else intersect_bounds(bounds, grid)
+            if readable is None or coverage.covers_bounds(readable):
+                results.append(self._rebuild_value_range(bounds, options, cache))
+
+        return results
+
+    def _rebuild_value_range(
+        self,
+        bounds: Bounds,
+        options: ReadOptions,
+        cache: Any,
+    ) -> ValueRange:
+        """Build the ValueRange for one bounded request from cached values."""
+        matrix = cache.snapshot(bounds)
+
+        if options.major_dimension == str(Dimension.cols):
+            matrix = [
+                [matrix[row][column] for row in range(len(matrix))]
+                for column in range(len(matrix[0]) if matrix else 0)
+            ]
+
+        return ValueRange.from_json(
+            {
+                "range": cache.range_label(bounds_to_a1(bounds), self.title),
+                "majorDimension": options.major_dimension,
+                "values": matrix,
+            }
+        )
 
     def update(
         self,

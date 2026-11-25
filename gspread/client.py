@@ -65,6 +65,58 @@ class Client:
         """
         self.http_client.set_timeout(timeout)
 
+    def read_round(self) -> Any:
+        """Context manager that activates the in-round batch read cache.
+
+        While the round is active the sheets being read are assumed to be
+        stable, so :meth:`Worksheet.batch_get
+        <gspread.worksheet.Worksheet.batch_get>` only requests cells it has
+        not read yet in this round.  The cache is isolated per account,
+        worksheet and render options, and is discarded when the round ends so
+        that the next round reads fresh values::
+
+            with client.read_round():
+                worksheet.batch_get(["A1:C10", "B5:D20"])
+                worksheet.batch_get(["B5:D20"])  # fully served from cache
+
+        .. versionadded:: 6.3
+        """
+        return self.http_client.read_round()
+
+    def start_read_round(self) -> Any:
+        """Start a read round, returning its cache.
+
+        Prefer the :meth:`read_round` context manager; use this pair with
+        :meth:`end_read_round` when the round's lifetime does not fit in a
+        ``with`` block.
+
+        .. versionadded:: 6.3
+        """
+        return self.http_client.start_read_round()
+
+    def end_read_round(self) -> None:
+        """End a round started with :meth:`start_read_round`.
+
+        .. versionadded:: 6.3
+        """
+        self.http_client.end_read_round()
+
+    @property
+    def read_cache_active(self) -> bool:
+        """Whether a read round is currently active."""
+        return self.http_client.read_cache_active
+
+    def clear_read_cache(self) -> None:
+        """Forget every cell read in the current round.
+
+        The next :meth:`Worksheet.batch_get
+        <gspread.worksheet.Worksheet.batch_get>` call requests everything
+        again.  Safe to call when no round is active.
+
+        .. versionadded:: 6.3
+        """
+        self.http_client.clear_read_cache()
+
     def get_file_drive_metadata(self, id: str) -> Any:
         """Get the metadata from the Drive API for a specific file
         This method is mainly here to retrieve the create/update time

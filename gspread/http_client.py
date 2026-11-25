@@ -30,6 +30,7 @@ from google.auth.transport.requests import AuthorizedSession
 from requests import Response, Session
 
 from .exceptions import APIError, UnSupportedExportFormat
+from .read_cache import ReadCache, ReadRound, read_round_active
 from .urls import (
     DRIVE_FILES_API_V3_URL,
     DRIVE_FILES_UPLOAD_API_V2_URL,
@@ -86,6 +87,99 @@ class HTTPClient:
             self.session = AuthorizedSession(self.auth)
 
         self.timeout: Optional[Union[float, Tuple[float, float]]] = None
+
+        # In-round batch read cache.  ``_read_cache`` always exists so that
+        # ``Worksheet.batch_get`` can consult it, but it is only used while
+        # ``_read_round_depth`` is greater than zero.
+        self._read_cache: ReadCache = ReadCache()
+        self._read_round_depth: int = 0
+
+    def start_read_round(self) -> ReadCache:
+        """Start a round of stable reads and return its cache.
+
+        While a read round is active, :meth:`Worksheet.batch_get
+        <gspread.worksheet.Worksheet.batch_get>` only requests cells that have
+        not been read yet in this round, and a full cache hit sends no request
+        at all.
+
+        The cache is emptied when the round starts (a new round must read
+        fresh values) and dropped again when the outermost round ends.
+        Rounds may be nested.
+
+        Prefer the :meth:`read_round` context manager over calling this
+        method directly.
+
+        .. versionadded:: 6.3
+        """
+        if self._read_round_depth == 0:
+            self._read_cache.clear()
+
+        self._read_round_depth += 1
+        return self._read_cache
+
+    def end_read_round(self) -> None:
+        """End a round started with :meth:`start_read_round`.
+
+        The cached coverage is discarded when the outermost round ends, so the
+        next round re-reads everything.  Calling this without an active round
+        is a no-op.
+        """
+        if self._read_round_depth == 0:
+            return
+
+        self._read_round_depth -= 1
+
+        if self._read_round_depth == 0:
+            self._read_cache.clear()
+
+    def clear_read_cache(self) -> None:
+        """Forget every cell read so far in the current round.
+
+        The next :meth:`Worksheet.batch_get
+        <gspread.worksheet.Worksheet.batch_get>` call requests everything
+        again.  Safe to call when no round is active.
+
+        .. versionadded:: 6.3
+        """
+        self._read_cache.clear()
+
+    def read_round(self) -> ReadRound:
+        """Context manager that activates the in-round batch read cache.
+
+        The sheet content is assumed to be stable for the duration of the
+        round, so :meth:`Worksheet.batch_get
+        <gspread.worksheet.Worksheet.batch_get>` remembers what it has read
+        and only requests cells it has not seen yet::
+
+            with client.read_round():
+                worksheet.batch_get(["A1:C10", "B5:D20"])
+                # only the cells outside A1:C10 are requested here
+                worksheet.batch_get(["B5:D20"])
+
+        The cache is isolated per account, worksheet and render options, and
+        is discarded when the round ends so that the next round reads fresh
+        values.
+
+        .. versionadded:: 6.3
+        """
+        return ReadRound(self)
+
+    @property
+    def read_cache_active(self) -> bool:
+        """Whether a read round is currently active."""
+        return read_round_active(self)
+
+    @property
+    def read_cache(self) -> ReadCache:
+        """The registry holding the in-round cache of this client.
+
+        It exists at all times but is only consulted by
+        :meth:`Worksheet.batch_get <gspread.worksheet.Worksheet.batch_get>`
+        while a read round is active.
+
+        .. versionadded:: 6.3
+        """
+        return self._read_cache
 
     def login(self) -> None:
         from google.auth.transport.requests import Request
@@ -268,6 +362,8 @@ class HTTPClient:
         if params is None:
             params = {}
 
+        # Do not mutate the caller's dict: it may be reused across calls.
+        params = dict(params)
         params["ranges"] = ranges
 
         url = SPREADSHEET_VALUES_BATCH_URL % id
